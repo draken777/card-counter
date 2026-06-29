@@ -1,22 +1,15 @@
 """
-Hi-Lo Card Counter — Screen Scanner
-=====================================
-Scans your screen every 2 seconds using OCR to detect card values,
-updates running count and true count automatically.
+Hi-Lo Card Counter — Screen Scanner (Smart Card Detection)
+===========================================================
+Detects actual card shapes first, then reads values from them.
+Works with live dealer streams.
 
 Requirements:
     pip install pillow pytesseract opencv-python mss
-    Also install Tesseract OCR:
-        Windows: https://github.com/UB-Mannheim/tesseract/wiki
-        Mac:     brew install tesseract
-        Linux:   sudo apt install tesseract-ocr
-
-Run:
-    python card_counter.py
+    Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki
 """
 
 import tkinter as tk
-from tkinter import font as tkfont
 import threading
 import time
 import re
@@ -26,40 +19,103 @@ import cv2
 from PIL import Image
 import pytesseract
 
-# ── CONFIG ──────────────────────────────────────────────────────────────────
+# ── CONFIG ───────────────────────────────────────────────────────────────────
 TOTAL_DECKS   = 6
-PENETRATION   = 0.75          # 0.75 = 75% of shoe dealt before reshuffle
-SCAN_INTERVAL = 2             # seconds between screen scans
+PENETRATION   = 0.75
+SCAN_INTERVAL = 2
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-# ── HI-LO LOGIC ─────────────────────────────────────────────────────────────
+# ── HI-LO LOGIC ──────────────────────────────────────────────────────────────
 TOTAL_CARDS   = TOTAL_DECKS * 52
 SHUFFLE_POINT = int(TOTAL_CARDS * PENETRATION)
 
 LOW_CARDS  = {'2', '3', '4', '5', '6'}
 HIGH_CARDS = {'10', 'J', 'Q', 'K', 'A'}
 NEUTRAL    = {'7', '8', '9'}
-ALL_CARDS  = LOW_CARDS | HIGH_CARDS | NEUTRAL
 
 def hilo_tag(card: str) -> int:
     if card in LOW_CARDS:  return +1
     if card in HIGH_CARDS: return -1
     return 0
 
-def extract_cards_from_image(img_np: np.ndarray) -> list:
-    """Convert screenshot → grayscale → OCR → parse card tokens."""
-    gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
-    scaled = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-    _, thresh = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+# ── CARD DETECTION ───────────────────────────────────────────────────────────
+def find_card_regions(img_np: np.ndarray) -> list:
+    """
+    Find white/light rectangular card shapes on the blue table.
+    Returns list of cropped card corner images.
+    """
+    if img_np.shape[2] == 4:
+        img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
+
+    # Isolate white/light areas (cards) using HSV
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_BGR2HSV)
+    lower_white = np.array([0, 0, 180])
+    upper_white = np.array([180, 50, 255])
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # Clean up noise
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    card_crops = []
+    h_screen, w_screen = img_np.shape[:2]
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+
+        # Filter by size
+        if area < 2000 or area > 80000:
+            continue
+
+        # Filter by aspect ratio — cards are portrait shaped
+        aspect = h / w
+        if aspect < 0.8 or aspect > 2.5:
+            continue
+
+        # Only crop top-left corner where card value is printed
+        corner_h = max(20, int(h * 0.35))
+        corner_w = max(20, int(w * 0.45))
+
+        y2 = min(y + corner_h, h_screen)
+        x2 = min(x + corner_w, w_screen)
+        corner = img_np[y:y2, x:x2]
+
+        if corner.size > 0:
+            card_crops.append(corner)
+
+    return card_crops
+
+
+def ocr_card_corner(corner_img: np.ndarray) -> str:
+    """Run OCR on a single card corner, return card value or empty string."""
+    scaled = cv2.resize(corner_img, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     pil_img = Image.fromarray(thresh)
     raw = pytesseract.image_to_string(
         pil_img,
-        config="--psm 6 -c tessedit_char_whitelist=0123456789AJQK"
+        config="--psm 10 -c tessedit_char_whitelist=0123456789AJQK"
     )
     tokens = re.findall(r'\b(10|[2-9]|[AJQK])\b', raw.upper())
-    return tokens
+    return tokens[0] if tokens else ""
 
-# ── MAIN APP ─────────────────────────────────────────────────────────────────
+
+def extract_cards_from_image(img_np: np.ndarray) -> list:
+    """Full pipeline: find card shapes → OCR each corner → return values."""
+    card_regions = find_card_regions(img_np)
+    found_cards = []
+    for region in card_regions:
+        value = ocr_card_corner(region)
+        if value:
+            found_cards.append(value)
+    return found_cards
+
+
+# ── MAIN APP ──────────────────────────────────────────────────────────────────
 class CardCounterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -72,27 +128,22 @@ class CardCounterApp:
         self.running_count = 0
         self.cards_seen    = 0
         self.true_count    = 0.0
-        self.seen_tokens   = set()
         self.scanning      = False
         self.last_cards    = []
 
         self._build_ui()
         self._update_display()
 
-    # ── UI ──────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # Title bar
         tk.Label(self.root, text="♠ HI-LO COUNTER ♠",
                  bg="#0a0a0a", fg="#f0c040",
                  font=("Courier", 13, "bold")).pack(padx=12, pady=(10, 2))
 
         tk.Frame(self.root, bg="#333", height=1).pack(fill="x", padx=10)
 
-        # Running count label
-        self.rc_label = tk.Label(self.root, text="Running Count",
-                                 bg="#0a0a0a", fg="#888",
-                                 font=("Courier", 9))
-        self.rc_label.pack(padx=12, pady=(8, 0))
+        tk.Label(self.root, text="Running Count",
+                 bg="#0a0a0a", fg="#888",
+                 font=("Courier", 9)).pack(padx=12, pady=(8, 0))
 
         self.rc_value = tk.Label(self.root, text="0",
                                  bg="#0a0a0a", fg="#ffffff",
@@ -101,11 +152,9 @@ class CardCounterApp:
 
         tk.Frame(self.root, bg="#222", height=1).pack(fill="x", padx=10)
 
-        # True count
-        self.tc_label = tk.Label(self.root, text="True Count",
-                                 bg="#0a0a0a", fg="#888",
-                                 font=("Courier", 9))
-        self.tc_label.pack(padx=12, pady=(6, 0))
+        tk.Label(self.root, text="True Count",
+                 bg="#0a0a0a", fg="#888",
+                 font=("Courier", 9)).pack(padx=12, pady=(6, 0))
 
         self.tc_value = tk.Label(self.root, text="0.00",
                                  bg="#0a0a0a", fg="#00e5ff",
@@ -114,7 +163,6 @@ class CardCounterApp:
 
         tk.Frame(self.root, bg="#222", height=1).pack(fill="x", padx=10)
 
-        # Stats row
         stats_frame = tk.Frame(self.root, bg="#0a0a0a")
         stats_frame.pack(fill="x", padx=12, pady=6)
 
@@ -128,14 +176,18 @@ class CardCounterApp:
                                 font=("Courier", 9))
         self.rem_lbl.pack(side="right")
 
-        # Advice banner
         self.advice_lbl = tk.Label(self.root, text="Bet minimum — neutral",
                                    bg="#1a1a1a", fg="#ffffff",
                                    font=("Courier", 10, "bold"),
                                    width=28, pady=5)
         self.advice_lbl.pack(fill="x", padx=10, pady=(2, 6))
 
-        # Last detected cards
+        # Shows how many card shapes were detected each scan
+        self.status_lbl = tk.Label(self.root, text="Card shapes found: —",
+                                   bg="#0a0a0a", fg="#555",
+                                   font=("Courier", 8))
+        self.status_lbl.pack(padx=12, pady=(0, 2))
+
         self.cards_lbl = tk.Label(self.root, text="Last scan: —",
                                   bg="#0a0a0a", fg="#555",
                                   font=("Courier", 8),
@@ -144,7 +196,6 @@ class CardCounterApp:
 
         tk.Frame(self.root, bg="#333", height=1).pack(fill="x", padx=10)
 
-        # Buttons
         btn_frame = tk.Frame(self.root, bg="#0a0a0a")
         btn_frame.pack(pady=8)
 
@@ -161,7 +212,6 @@ class CardCounterApp:
                   width=10, relief="flat", cursor="hand2",
                   command=self.reset).pack(side="left", padx=4)
 
-    # ── DISPLAY ─────────────────────────────────────────────────────────────
     def _update_display(self):
         rc  = self.running_count
         tc  = self.true_count
@@ -194,7 +244,6 @@ class CardCounterApp:
         if self.last_cards:
             self.cards_lbl.config(text="Last scan: " + "  ".join(self.last_cards))
 
-    # ── SCANNING ────────────────────────────────────────────────────────────
     def toggle_scan(self):
         if self.scanning:
             self.scanning = False
@@ -213,6 +262,10 @@ class CardCounterApp:
                     shot  = sct.grab(monitor)
                     img   = np.array(shot)
                     cards = extract_cards_from_image(img)
+
+                    regions_found = len(find_card_regions(img))
+                    self.root.after(0, lambda n=regions_found: self.status_lbl.config(
+                        text=f"Card shapes found: {n}"))
 
                     new_cards = [c for c in cards if c not in prev_tokens]
 
@@ -240,7 +293,6 @@ class CardCounterApp:
 
                 time.sleep(SCAN_INTERVAL)
 
-    # ── RESET ───────────────────────────────────────────────────────────────
     def reset(self):
         self.running_count = 0
         self.cards_seen    = 0
@@ -248,8 +300,9 @@ class CardCounterApp:
         self.last_cards    = []
         self._update_display()
         self.cards_lbl.config(text="Last scan: —")
+        self.status_lbl.config(text="Card shapes found: —")
 
-# ── ENTRY ────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     root = tk.Tk()
     app  = CardCounterApp(root)
