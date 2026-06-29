@@ -1,8 +1,8 @@
 """
-Hi-Lo Card Counter — Screen Scanner (Smart Card Detection)
-===========================================================
+Hi-Lo Card Counter — Screen Scanner (Smart Card Detection + Debug Overlay)
+===========================================================================
 Detects actual card shapes first, then reads values from them.
-Works with live dealer streams.
+Shows a debug window with boxes drawn around detected cards.
 
 Requirements:
     pip install pillow pytesseract opencv-python mss
@@ -10,13 +10,14 @@ Requirements:
 """
 
 import tkinter as tk
+from tkinter import ttk
 import threading
 import time
 import re
 import mss
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageTk
 import pytesseract
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
@@ -39,55 +40,49 @@ def hilo_tag(card: str) -> int:
     return 0
 
 # ── CARD DETECTION ───────────────────────────────────────────────────────────
-def find_card_regions(img_np: np.ndarray) -> list:
+def find_card_regions(img_np: np.ndarray):
     """
     Find white/light rectangular card shapes on the blue table.
-    Returns list of cropped card corner images.
+    Returns list of (x, y, w, h, corner_crop) tuples.
     """
     if img_np.shape[2] == 4:
         img_np = cv2.cvtColor(img_np, cv2.COLOR_BGRA2BGR)
 
-    # Isolate white/light areas (cards) using HSV
     hsv = cv2.cvtColor(img_np, cv2.COLOR_BGR2HSV)
     lower_white = np.array([0, 0, 180])
     upper_white = np.array([180, 50, 255])
     mask = cv2.inRange(hsv, lower_white, upper_white)
 
-    # Clean up noise
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    card_crops = []
+    results = []
     h_screen, w_screen = img_np.shape[:2]
 
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = w * h
 
-        # Filter by size
         if area < 2000 or area > 80000:
             continue
 
-        # Filter by aspect ratio — cards are portrait shaped
         aspect = h / w
         if aspect < 0.8 or aspect > 2.5:
             continue
 
-        # Only crop top-left corner where card value is printed
         corner_h = max(20, int(h * 0.35))
         corner_w = max(20, int(w * 0.45))
-
         y2 = min(y + corner_h, h_screen)
         x2 = min(x + corner_w, w_screen)
         corner = img_np[y:y2, x:x2]
 
         if corner.size > 0:
-            card_crops.append(corner)
+            results.append((x, y, w, h, corner))
 
-    return card_crops
+    return results
 
 
 def ocr_card_corner(corner_img: np.ndarray) -> str:
@@ -104,15 +99,50 @@ def ocr_card_corner(corner_img: np.ndarray) -> str:
     return tokens[0] if tokens else ""
 
 
-def extract_cards_from_image(img_np: np.ndarray) -> list:
-    """Full pipeline: find card shapes → OCR each corner → return values."""
-    card_regions = find_card_regions(img_np)
+def extract_cards_with_positions(img_np: np.ndarray):
+    """
+    Full pipeline: find card shapes → OCR each corner → return values + positions.
+    Returns: (cards_list, debug_img)
+    """
+    regions = find_card_regions(img_np)
     found_cards = []
-    for region in card_regions:
-        value = ocr_card_corner(region)
+
+    # Make a downscaled copy for the debug overlay
+    scale = 0.35
+    debug_img = cv2.resize(img_np, None, fx=scale, fy=scale)
+    if debug_img.shape[2] == 4:
+        debug_img = cv2.cvtColor(debug_img, cv2.COLOR_BGRA2BGR)
+
+    for (x, y, w, h, corner) in regions:
+        value = ocr_card_corner(corner)
+
+        # Scale coordinates for debug image
+        dx, dy, dw, dh = int(x*scale), int(y*scale), int(w*scale), int(h*scale)
+
         if value:
+            # Green box + label for successfully read cards
+            cv2.rectangle(debug_img, (dx, dy), (dx+dw, dy+dh), (0, 220, 80), 2)
+            cv2.circle(debug_img, (dx + 6, dy + 6), 5, (0, 220, 80), -1)
+            cv2.putText(debug_img, value, (dx + 2, dy + dh - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 80), 2)
             found_cards.append(value)
-    return found_cards
+        else:
+            # Orange box for detected shape but couldn't read value
+            cv2.rectangle(debug_img, (dx, dy), (dx+dw, dy+dh), (0, 140, 255), 2)
+            cv2.circle(debug_img, (dx + 6, dy + 6), 5, (0, 140, 255), -1)
+            cv2.putText(debug_img, "?", (dx + 2, dy + dh - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+
+    # Legend
+    cv2.rectangle(debug_img, (8, 8), (180, 52), (30, 30, 30), -1)
+    cv2.circle(debug_img, (20, 22), 5, (0, 220, 80), -1)
+    cv2.putText(debug_img, "= card read OK", (30, 27),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    cv2.circle(debug_img, (20, 42), 5, (0, 140, 255), -1)
+    cv2.putText(debug_img, "= shape found, no read", (30, 47),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+    return found_cards, debug_img
 
 
 # ── MAIN APP ──────────────────────────────────────────────────────────────────
@@ -130,6 +160,8 @@ class CardCounterApp:
         self.true_count    = 0.0
         self.scanning      = False
         self.last_cards    = []
+        self.debug_window  = None
+        self.debug_label   = None
 
         self._build_ui()
         self._update_display()
@@ -182,7 +214,6 @@ class CardCounterApp:
                                    width=28, pady=5)
         self.advice_lbl.pack(fill="x", padx=10, pady=(2, 6))
 
-        # Shows how many card shapes were detected each scan
         self.status_lbl = tk.Label(self.root, text="Card shapes found: —",
                                    bg="#0a0a0a", fg="#555",
                                    font=("Courier", 8))
@@ -211,6 +242,40 @@ class CardCounterApp:
                   font=("Courier", 10, "bold"),
                   width=10, relief="flat", cursor="hand2",
                   command=self.reset).pack(side="left", padx=4)
+
+        # Debug button
+        tk.Button(btn_frame, text="🔍 DEBUG",
+                  bg="#4a148c", fg="white",
+                  font=("Courier", 10, "bold"),
+                  width=10, relief="flat", cursor="hand2",
+                  command=self.toggle_debug).pack(side="left", padx=4)
+
+    def toggle_debug(self):
+        if self.debug_window and tk.Toplevel.winfo_exists(self.debug_window):
+            self.debug_window.destroy()
+            self.debug_window = None
+        else:
+            self.debug_window = tk.Toplevel(self.root)
+            self.debug_window.title("Debug — Card Detection Overlay")
+            self.debug_window.configure(bg="#0a0a0a")
+            self.debug_window.attributes("-topmost", True)
+
+            tk.Label(self.debug_window,
+                     text="🟢 = card read   🟠 = shape found, value unclear",
+                     bg="#0a0a0a", fg="#aaa",
+                     font=("Courier", 8)).pack(pady=(6, 2))
+
+            self.debug_label = tk.Label(self.debug_window, bg="#0a0a0a")
+            self.debug_label.pack(padx=8, pady=(0, 8))
+
+    def _update_debug(self, debug_img_bgr):
+        if not self.debug_window or not tk.Toplevel.winfo_exists(self.debug_window):
+            return
+        rgb = cv2.cvtColor(debug_img_bgr, cv2.COLOR_BGR2RGB)
+        pil  = Image.fromarray(rgb)
+        photo = ImageTk.PhotoImage(pil)
+        self.debug_label.config(image=photo)
+        self.debug_label.image = photo  # keep reference
 
     def _update_display(self):
         rc  = self.running_count
@@ -261,10 +326,13 @@ class CardCounterApp:
                 try:
                     shot  = sct.grab(monitor)
                     img   = np.array(shot)
-                    cards = extract_cards_from_image(img)
+                    cards, debug_img = extract_cards_with_positions(img)
 
-                    regions_found = len(find_card_regions(img))
-                    self.root.after(0, lambda n=regions_found: self.status_lbl.config(
+                    # Update debug overlay
+                    self.root.after(0, lambda d=debug_img: self._update_debug(d))
+
+                    # Update status
+                    self.root.after(0, lambda n=len(cards): self.status_lbl.config(
                         text=f"Card shapes found: {n}"))
 
                     new_cards = [c for c in cards if c not in prev_tokens]
